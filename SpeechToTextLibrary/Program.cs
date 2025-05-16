@@ -9,7 +9,6 @@ namespace SpeechToTextLibrary
         {
             Console.WriteLine("Hello, World!");
             STT speech = new();
-            //Stream st = File.Open(@"C:\Users\Dominik\Music\ai_start.wav", FileMode.Open);
             for (int i = 0; i < 20; i++)
             {
                 string text = await speech.SpeechToText();
