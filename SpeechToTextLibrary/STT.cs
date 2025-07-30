@@ -2,7 +2,6 @@
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Text.Json;
 using NAudio.Utils;
 using NAudio.Wave;
@@ -10,220 +9,291 @@ using NAudio.Wave;
 //by EVOLVE
 namespace NAudio.STT
 {
-    internal class STT: IDisposable
+    public class STTOptions
     {
-        private readonly string flac_path, tmp_path;
-        public float silence_threshold { get; private set; } = 0.03f; float _silence_threshold;
-        WaveInEvent wave_in;
-        HttpClient client;
+        public float VoiceDetectionThreshold { get; set; } = 0.02f;
+        public int SilenceTimeoutMs { get; set; } = 3000;
+        public int SpeechStartSensitivityFrames { get; set; } = 3;
+        public int SpeechEndHangoverMs { get; set; } = 500;
+        public int MinimumSpeechDurationMs { get; set; } = 300;
+        public double RmsSmoothingAlpha { get; set; } = 0.2;
+    }
 
-        public STT(int device_number = default, string flac_path = null!)
+    internal class STT : IDisposable
+    {
+        private readonly string _flac_path, _tmp_path;
+        private readonly WaveInEvent _wave_in;
+        private readonly HttpClient _client;
+        private readonly STTOptions _vad_options;
+
+        public STT(int device_number = 0, string? flac_path = null, STTOptions? vad_options = null)
         {
-            tmp_path = Path.Combine(Path.GetTempPath(), "speech");
-            this.flac_path = flac_path ?? "flac";
-            Directory.CreateDirectory(tmp_path);
-            _silence_threshold = silence_threshold;
+            _tmp_path = Path.Combine(Path.GetTempPath(), "speech_temp_" + Path.GetRandomFileName());
+            _flac_path = flac_path ?? "flac";
+            Directory.CreateDirectory(_tmp_path);
 
-            client = new HttpClient();
-            client.DefaultRequestHeaders.ExpectContinue = false;
+            _vad_options = vad_options ?? new STTOptions();
 
-            wave_in = new WaveInEvent
+            _client = new HttpClient();
+            _client.DefaultRequestHeaders.ExpectContinue = false;
+
+            _wave_in = new WaveInEvent
             {
                 WaveFormat = new WaveFormat(16000, 16, 1),
-                DeviceNumber = device_number
+                DeviceNumber = device_number,
+                BufferMilliseconds = 50
             };
         }
-
-        public async Task<string> SpeechToText(int silence_timeout_ms = 300, string language = "cs-CZ")
+        public async Task<string?> SpeechToText(string language = "cs-CZ")
         {
-            string result = null!;
-            float default_silence_threshold = silence_threshold;
-            int stream_empty_count = 0;
-            for(; ; )
+            MemoryStream? microphone_stream = null;
+            try
             {
-                Console.WriteLine($"{_silence_threshold} . {stream_empty_count}");
-                MemoryStream microphone_stream = await AutomaticRecordMicrophone(silence_timeout_ms, _silence_threshold);
-                if (microphone_stream == null)
-                { 
-                    stream_empty_count++;
-
-                    if (_silence_threshold > default_silence_threshold)
-                        _silence_threshold -= 0.0001f;
-
-                    continue;
+                microphone_stream = await AutomaticRecordMicrophone();
+                if (microphone_stream == null || microphone_stream.Length == 0)
+                {
+                    //Console.WriteLine("No valid speech segment recorded.");
+                    return null;
                 }
 
-                //microphone_stream = TrimSilence(microphone_stream);
+                microphone_stream.Position = 0;
 
-                result = await GetSpeechText(microphone_stream, language);
-                if (!string.IsNullOrEmpty(result))
-                { stream_empty_count = 0; break; }
-
-                _silence_threshold += 0.001f;
-                stream_empty_count = 0;
+                string? result = await GetSpeechText(microphone_stream, language);
+                return result;
             }
-            return result;
+            finally
+            {
+                microphone_stream?.Dispose();
+            }
         }
-        public async Task<MemoryStream> AutomaticRecordMicrophone(int silence_timeout_ms = 1000, float silence_threshold = 0.02f)
+        public async Task<MemoryStream?> AutomaticRecordMicrophone()
         {
             var ms_output = new MemoryStream();
+            var writer = new WaveFileWriter(new IgnoreDisposeStream(ms_output), _wave_in.WaveFormat);
 
-            var writer = new WaveFileWriter(new IgnoreDisposeStream(ms_output), wave_in.WaveFormat);
+            var tcs = new TaskCompletionSource<bool>();
 
-            var tcs = new TaskCompletionSource();
-            int silence_duration = 0;
-            bool voice_detected = false;
+            double smoothed_rms = 0.0;
+            int consecutive_voice_frames = 0, current_silence_duration_ms = 0;
+            bool speech_segment_started = false, valid_speech_recorded = false;
+            long total_samples_written = 0;
 
-            double smoothed_rms = 0, smoothing_factor = 0.9;
-
-            int active_frames = 0;
-            const int required_active_frames = 3;
-
-            EventHandler<WaveInEventArgs> data_available_handler = (s, e) =>
+            EventHandler<WaveInEventArgs> data_available_handler = (sender, e) =>
             {
+                if (e.BytesRecorded == 0) return;
                 writer.Write(e.Buffer, 0, e.BytesRecorded);
+                total_samples_written += e.BytesRecorded / _wave_in.WaveFormat.BlockAlign;
 
-                int bytes_per_sample = 2, samples = e.BytesRecorded / bytes_per_sample;
+                int samples = e.BytesRecorded / 2;
                 double sum_squares = 0;
-
                 for (int i = 0; i < samples; i++)
                 {
-                    short sample = BitConverter.ToInt16(e.Buffer, i * bytes_per_sample);
+                    short sample = BitConverter.ToInt16(e.Buffer, i * 2);
                     double sample32 = sample / 32768.0;
                     sum_squares += sample32 * sample32;
                 }
-
                 double rms = Math.Sqrt(sum_squares / samples);
-                smoothed_rms = (smoothing_factor * smoothed_rms) + ((1 - smoothing_factor) * rms);
-                //Console.WriteLine(smoothed_rms);
-                if (smoothed_rms > silence_threshold)
+
+                smoothed_rms = (_vad_options.RmsSmoothingAlpha * rms) + ((1 - _vad_options.RmsSmoothingAlpha) * smoothed_rms);
+                if (smoothed_rms > _vad_options.VoiceDetectionThreshold)
                 {
-                    active_frames++;
-                    if (active_frames >= required_active_frames)
+                    consecutive_voice_frames++;
+                    current_silence_duration_ms = 0;
+
+                    if (!speech_segment_started && consecutive_voice_frames >= _vad_options.SpeechStartSensitivityFrames)
                     {
-                        voice_detected = true;
-                        silence_duration = 0;
+                        speech_segment_started = true;
                     }
                 }
                 else
                 {
-                    active_frames = 0;
-                    silence_duration += wave_in.BufferMilliseconds;
-
-                    if (silence_duration >= silence_timeout_ms)
+                    consecutive_voice_frames = 0;
+                    if (speech_segment_started)
                     {
-                        wave_in.StopRecording();
+                        current_silence_duration_ms += _wave_in.BufferMilliseconds;
+                        if (current_silence_duration_ms >= _vad_options.SpeechEndHangoverMs)
+                        {
+                            _wave_in.StopRecording();
+                        }
+                    }
+                    else
+                    {
+                        current_silence_duration_ms += _wave_in.BufferMilliseconds;
+                        if (current_silence_duration_ms >= _vad_options.SilenceTimeoutMs)
+                        {
+                            _wave_in.StopRecording();
+                        }
                     }
                 }
             };
 
-            EventHandler<StoppedEventArgs> recording_stopped_handler = (s, e) =>
+            EventHandler<StoppedEventArgs> recording_stopped_handler = (sender, e) =>
             {
+                writer.Flush();
+
+                valid_speech_recorded = speech_segment_started && writer.TotalTime.TotalMilliseconds >= _vad_options.MinimumSpeechDurationMs;
+
+                if (!tcs.Task.IsCompleted)
+                    tcs.TrySetResult(valid_speech_recorded);
+            };
+
+            _wave_in.DataAvailable += data_available_handler;
+            _wave_in.RecordingStopped += recording_stopped_handler;
+
+            try
+            {
+                _wave_in.StartRecording();
+                valid_speech_recorded = await tcs.Task;
+            }
+            catch
+            {
+                if (!tcs.Task.IsCompleted) tcs.TrySetResult(false);
+                valid_speech_recorded = false;
+            }
+            finally
+            {
+                _wave_in.DataAvailable -= data_available_handler;
+                _wave_in.RecordingStopped -= recording_stopped_handler;
+
                 writer.Dispose();
-                wave_in.Dispose();
-                tcs.SetResult();
-            };
-
-            wave_in.DataAvailable += data_available_handler;
-            wave_in.RecordingStopped += recording_stopped_handler;
-
-            wave_in.StartRecording();
-            await tcs.Task;
-
-            wave_in.DataAvailable -= data_available_handler;
-            wave_in.RecordingStopped -= recording_stopped_handler;
-
-            ms_output.Position = 0;
-            return voice_detected ? ms_output : null!;
-        }
-        public async Task<string> GetSpeechText(Stream audio_wav, string language = "cs-CZ")
-        {
-            if (audio_wav == null)
-                return null!;
-
-            Stopwatch _st_watch = Stopwatch.StartNew();
-            audio_wav.Position = 0;
-            string tmp_flac = Path.Combine(tmp_path, "voice.flac");
-            string tmp_wav = Path.Combine(tmp_path, "voice.wav");
-
-            using var reader = new WaveFileReader(audio_wav);
-
-            var outFormat = new WaveFormat(16000, 16, 1);
-            using var resampler = new MediaFoundationResampler(reader, outFormat)
-            {
-                ResamplerQuality = 60
-            };
-
-            WaveFileWriter.CreateWaveFile(tmp_wav, resampler);
-            await ConvertWavToFlac(tmp_wav, tmp_flac);
-            _st_watch.Stop();
-
-
-            var url = $"http://www.google.com/speech-api/v2/recognize?client=chromium&lang={language}&key=AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw&pFilter=0";
-
-            var bytes = await File.ReadAllBytesAsync(tmp_flac);
-            using var ms = new MemoryStream(bytes);
-            using var content = new StreamContent(ms);
-            content.Headers.TryAddWithoutValidation("Content-Type", "audio/x-flac; rate=16000");
-
-            Stopwatch _ls_watch = Stopwatch.StartNew();
-            var response = await client.PostAsync(url, content);
-            var json = await response.Content.ReadAsStringAsync();
-
-            _ls_watch.Stop();
-            Console.WriteLine($"{_st_watch.ElapsedMilliseconds} MS  => {_ls_watch.ElapsedMilliseconds} MS");
-
-            foreach (var line in json.Split('\n'))
-            {
-                if (line.Contains("\"transcript\""))
-                {
-                    using var doc = JsonDocument.Parse(line);
-                    var transcript = doc.RootElement
-                        .GetProperty("result")[0]
-                        .GetProperty("alternative")[0]
-                        .GetProperty("transcript")
-                        .GetString();
-                    return transcript ?? null!;
-                }
             }
 
-            return null!;
-        }
-        public async Task ConvertWavToFlac(string path_wav, string output_path_flac)
-        {
-            if(File.Exists(path_wav))
+            if (valid_speech_recorded)
             {
-                var process = Process.Start(new ProcessStartInfo() 
-                {
-                    FileName = Path.Combine(flac_path, "flac-win32.exe"),
-                    Arguments = $"--best -f -o \"{output_path_flac}\" \"{path_wav}\"",
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = false,
-                    RedirectStandardError = false
-                });
-
-                if (process == null)
-                    throw new Exception($"FLAC encoding failed");
-
-                await process.WaitForExitAsync();
-                
-                if (process.ExitCode != 0)
-                {
-                    throw new Exception($"FLAC encoding failed");
-                }
+                ms_output.Position = 0;
+                return ms_output;
             }
-           
+            else
+            {
+                ms_output.Dispose();
+                return null;
+            }
         }
+        public async Task<string?> GetSpeechText(Stream audio_wav_stream, string language = "cs-CZ")
+        {
+            if (audio_wav_stream == null || audio_wav_stream.Length == 0)
+            {
+                return null;
+            }
+            audio_wav_stream.Position = 0;
+
+            string tmp_flac = Path.Combine(_tmp_path, "voice.flac"),
+                tmp_wav = Path.Combine(_tmp_path, "voice_resampled.wav");
+
+            try
+            {
+                //Stopwatch conversion_watch = Stopwatch.StartNew();
+                using (var reader = new WaveFileReader(audio_wav_stream))
+                {
+                    WaveFileWriter.CreateWaveFile(tmp_wav, reader);
+                }
+
+                await ConvertWavToFlac(tmp_wav, tmp_flac);
+                //conversion_watch.Stop();
+
+                var url = $"https://www.google.com/speech-api/v2/recognize?client=chromium&lang={language}&key=AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw&pFilter=0";
+                byte[] flac_bytes = await File.ReadAllBytesAsync(tmp_flac);
+                using var content = new ByteArrayContent(flac_bytes);
+                content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("audio/x-flac")
+                {
+                    Parameters = { new System.Net.Http.Headers.NameValueHeaderValue("rate", "16000") }
+                };
+
+                //Stopwatch api_call_watch = Stopwatch.StartNew();
+                var response = await _client.PostAsync(url, content);
+                var json_response = await response.Content.ReadAsStringAsync();
+                //api_call_watch.Stop();
+
+                if (!response.IsSuccessStatusCode)
+                    return null;
+
+                foreach (var line in json_response.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    if (line.Contains("\"transcript\""))
+                    {
+                        try
+                        {
+                            using JsonDocument doc = JsonDocument.Parse(line);
+                            JsonElement result_element = doc.RootElement.GetProperty("result");
+                            if (result_element.GetArrayLength() > 0)
+                            {
+                                JsonElement alternativeElement = result_element[0].GetProperty("alternative");
+                                if (alternativeElement.GetArrayLength() > 0)
+                                {
+                                    string? transcript = alternativeElement[0].GetProperty("transcript").GetString();
+                                    return transcript;
+                                }
+                            }
+                        }
+                        catch
+                        { }
+                    }
+                }
+                return null;
+            }
+            catch
+            { return null; }
+            finally
+            {
+                if (File.Exists(tmp_wav)) File.Delete(tmp_wav);
+                if (File.Exists(tmp_flac)) File.Delete(tmp_flac);
+            }
+        }
+        public async Task ConvertWavToFlac(string wav_path, string output_flac_path)
+        {
+            if (!File.Exists(wav_path))
+                throw new FileNotFoundException("Input WAV file not found for FLAC conversion.", wav_path);
+
+            string flac_ex = Path.Combine(_flac_path, "flac-win32.exe");
+            if (!File.Exists(flac_ex) && _flac_path.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && File.Exists(_flac_path))
+            {
+                flac_ex = _flac_path;
+            }
+            else if (!File.Exists(flac_ex))
+            {
+                flac_ex = Path.Combine(_flac_path, "flac.exe");
+                if (!File.Exists(flac_ex))
+                    throw new FileNotFoundException($"FLAC executable not found. Looked in: {Path.Combine(_flac_path, "flac-win32.exe")} and {Path.Combine(_flac_path, "flac.exe")}. Ensure flac_path is set correctly.");
+            }
+
+
+            var process_info = new ProcessStartInfo
+            {
+                FileName = flac_ex,
+                Arguments = $"--best -f -o \"{output_flac_path}\" \"{wav_path}\"",
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using var process = Process.Start(process_info);
+            if (process == null)
+                throw new Exception("FLAC encoding process could not be started.");
+            
+            string std_out = await process.StandardOutput.ReadToEndAsync(),
+                std_err = await process.StandardError.ReadToEndAsync();
+
+            await process.WaitForExitAsync();
+
+            if (process.ExitCode != 0)
+                throw new Exception($"FLAC encoding failed with exit code {process.ExitCode}. Error: {std_err}");
+        }
+
         public void Dispose()
         {
+            _wave_in.Dispose();
+            _client.Dispose();
+
             try
-            { 
-                client.Dispose();
-                if (Directory.Exists(tmp_path)) Directory.Delete(tmp_path, recursive: true);
+            {
+                if (Directory.Exists(_tmp_path))
+                    Directory.Delete(_tmp_path, recursive: true);
             }
             catch
             { }
+
+            GC.SuppressFinalize(this);
         }
     }
 }
